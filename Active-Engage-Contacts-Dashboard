@@ -1,0 +1,169 @@
+// Dashboard Monthly Active Users by month - Monthly count of users who access dashboard. 
+// https://docs.google.com/spreadsheets/d/1ck3KQfNxwHXVEF9IYfgc-F0a9eFcBbCuQ8CjH6CMZRY/edit#gid=0
+select date_trunc(month,p.HR) AS month
+,count(distinct p.user_id) as distinct_users
+,count(distinct 
+case when u.is_org_admin 
+then p.user_id end) as distinct_org_admins
+,count(distinct 
+case when u.is_org_write_admin 
+then p.user_id end) as distinct_org_write_admins
+from
+(select network_id, user_id, hr
+from fact.dashboard_pageviews_agg
+where hr between '2019-1-1 00:00:00' and '2019-3-1 00:00:00'
+--replace it with the desired date frame
+and network_id != -1
+) p
+left join fact.f_networks n on p.network_id = n.network_id
+left join fact.users u on p.user_id = u.id
+where n.organization_id != 1
+and n.organization_id != 3 -- remove Meraki networks
+and u.email_domain not in ('@meraki.com','@cisco.com') 
+-- remove meraki users
+group by 1;
+
+
+// Pulls HASHED_EMAIL (both), account_id (sfdc) , user_id (non-sfdc)
+select distinct HASHED_EMAIL, account_id, user_id
+from (
+select network_id, user_id, hr
+from fact.dashboard_pageviews_agg
+where hr between '2019-11-1 00:00:00' and '2020-4-1 00:00:00'
+--replace it with the desired date frame
+and network_id != -1) p
+left join (
+select network_id, account_id
+from fact.hardware_linkage hl
+where organization_id != 1
+and organization_id != 3 and network_id != 1
+--remove meraki networks
+and hl.account_type = 'End Cust'
+and hl.booking_type = 'End Cust'
+and hl.lifetime_bookings > 0
+group by network_id, account_id) hl
+on p.network_id = hl.network_id
+left join fact.users u on p.user_id = u.id
+where u.email_domain not in ('@meraki.com','@cisco.com') 
+-- remove meraki users
+and is_reseller ='FALSE'
+and account_id is not null
+and deleted_at is null
+and HASHED_EMAIL is not null
+and email_verified ='TRUE';
+
+// Create temporary table to use data freely
+select distinct HASHED_EMAIL, account_id, user_id
+from (
+select network_id, user_id, hr
+from fact.dashboard_pageviews_agg
+where hr between '2019-11-1 00:00:00' and '2020-4-1 00:00:00'
+--replace it with the desired date frame
+and network_id != -1) p
+left join (
+select network_id, account_id
+from fact.hardware_linkage hl
+where organization_id != 1
+and organization_id != 3 and network_id != 1
+--remove meraki networks
+and hl.account_type = 'End Cust'
+and hl.booking_type = 'End Cust'
+and hl.lifetime_bookings > 0
+group by network_id, account_id) hl
+on p.network_id = hl.network_id
+left join fact.users u on p.user_id = u.id
+where u.email_domain not in ('@meraki.com','@cisco.com') 
+-- remove meraki users
+and is_reseller ='FALSE'
+and account_id is not null
+and deleted_at is null
+and HASHED_EMAIL is not null
+and email_verified ='TRUE')
+
+//Combine temporary snapshot of NPS criteria (table)
+create table mt_nps_april2020 as (select distinct a.account_id
+, sum(a.lifetime_sm_purchases) as HAS_SM
+, sum(a.lifetime_mv_purchases) as HAS_MV
+, sum(a.lifetime_mx_purchases) as HAS_MX
+, sum(a.lifetime_ms_purchases) as HAS_MS
+, sum(a.lifetime_mr_purchases) as HAS_MR
+from fact.account a
+// sample(30)
+where a.account_id not in (select account_id from mt_accounts_for_cisco_nps) // exclude people we've already added for another product
+and a.account_id not in (select account_id_case_safe from mt_recentSurveyRecipients) // exclude people we surveyed recently
+
+// then go pull the accounts we want
+and a.account_id in
+(
+// get data from bookings about purchases and from accounts about account metadata
+select distinct bookings.account_id
+from fact.full_bookings_detail bookings
+sample(60)
+join fact.account a
+on bookings.account_id = a.account_id
+
+// include end customer accounts in english speaking countries
+where bookings.account_type = 'End Cust'
+and (a.region = 'UKI' or a.region = 'Canada'
+or a.region = 'United States'
+or a.country_name = 'New Zealand'
+or a.country_name = 'Singapore'
+or a.country_name = 'Australia')
+
+// that bought the product in question in the last ~1 years
+and bookings.booked_fiscal_year >= '2018'
+
+// comment or uncomment the product codes/categories in these lines to add/target different product lines
+// MR
+// and a.lifetime_mr_purchases > 150 and bookings.prod_category = 'MR'
+
+// SM
+// and a.lifetime_sm_purchases > 150 and bookings.prod_category = 'SM'
+
+// MX small branch
+// and a.lifetime_mx_purchases > 300 and bookings.prod_code LIKE '%MX6%'
+
+// MX large branch
+// and a.lifetime_mx_purchases > 300
+// and (bookings.prod_code LIKE '%MX84%' or bookings.prod_code LIKE '%MX100%' or bookings.prod_code LIKE '%MX250%' or bookings.prod_code LIKE '%MX450%')
+
+// MS
+// and a.lifetime_ms_purchases > 500 and bookings.prod_category = 'MS'
+
+// MV
+// and a.lifetime_mv_purchases > 100 and bookings.prod_category = 'MV'
+
+// where contacts haven't opted out of email
+and bookings.account_id not in (
+select bookings.account_id
+from fact.full_bookings_detail bookings
+join SALESFORCE_STAGE.S_CONTACT as s
+on bookings.account_id = s.accountid
+where s.hasoptedoutofemail = 'TRUE'
+)
+group by bookings.account_id
+)
+group by a.account_id
+)
+
+//Combine Dashboard temporary table with NPS temporary table with Salesforce table
+select distinct CONTACT_ID_CASE_SAFE__C as contact_id, account_id, b.LASTACTIVITYDATE
+from MT_ACTIVE_DASHBOARD_ACCOUNTS_APRIL2020_REV a
+inner join salesforce_stage.s_contact b on a.account_id = b.accountid
+and a.account_id in (select account_id from mt_nps_april2020)
+order by 2 desc;
+
+//Get 10,0000 records from the combined table with snowflake logic (Fraction-based Row Sampling)
+// select * from testtable sample (10);
+
+create table MT_NPS_APRIL2020_TABLE_10percent as (
+select account_id,CONTACT_ID_CASE_SAFE__C as contact_id, b.LASTACTIVITYDATE
+from MT_ACTIVE_DASHBOARD_ACCOUNTS_APRIL2020_REV a
+inner join salesforce_stage.s_contact b on a.account_id = b.accountid
+and a.account_id in (select account_id from mt_nps_april2020)
+sample(10)
+);
+
+//Export and Upload into Marketo via Lead Processing and Salesforce Campaign 
+
+
